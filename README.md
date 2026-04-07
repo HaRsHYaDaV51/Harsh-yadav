@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="mailto:harshraoyadav5252@gmail.com">📧 Email</a> &nbsp;|&nbsp;
-  <a href="https://www.linkedin.com/in/harsh-yadav">💼 LinkedIn</a>
+  <a href="https://www.linkedin.com/in/harsh-yadav-3a0a09280/">💼 LinkedIn</a>
 </p>
 
 ---
