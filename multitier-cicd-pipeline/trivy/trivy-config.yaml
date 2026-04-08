@@ -1,0 +1,49 @@
+# Trivy Configuration
+# Used by both filesystem and image scans in the Jenkins pipeline
+
+# Severity levels to detect
+severity:
+  - HIGH
+  - CRITICAL
+
+# Exit with non-zero code if vulnerabilities found
+exit-code: 1
+
+# Output format
+format: table
+
+# Ignore unfixed vulnerabilities (comment out in strict environments)
+# ignore-unfixed: true
+
+# Cache directory
+cache-dir: /tmp/trivy-cache
+
+# Timeout for scanning
+timeout: 10m
+
+# DB
+db:
+  no-update: false
+
+# Vuln types to scan
+vuln-type:
+  - os
+  - library
+
+# Security checks
+security-checks:
+  - vuln
+  - secret
+  - config
+
+# Skip dirs
+skip-dirs:
+  - node_modules
+  - .git
+  - vendor
+  - target/dependency
+
+# File patterns to skip
+skip-files:
+  - "**/*.test.js"
+  - "**/*_test.go"

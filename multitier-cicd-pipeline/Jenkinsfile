@@ -1,0 +1,278 @@
+pipeline {
+    agent any
+
+    environment {
+        APP_NAME        = "multitier-webapp"
+        AWS_REGION      = "us-east-1"
+        ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_REPO        = "${ECR_REGISTRY}/${APP_NAME}"
+        IMAGE_TAG       = "${BUILD_NUMBER}"
+        SONAR_PROJECT   = "multitier-webapp"
+        TF_ENV          = "${BRANCH_NAME == 'main' ? 'prod' : 'dev'}"
+    }
+
+    tools {
+        maven 'Maven-3.9'
+        jdk   'JDK-17'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 45, unit: 'MINUTES')
+        timestamps()
+    }
+
+    stages {
+
+        // ─────────────────────────────────────
+        stage('📥 Checkout') {
+            steps {
+                git branch: env.BRANCH_NAME,
+                    url: 'https://github.com/HaRsHYaDaV51/Harsh-yadav.git'
+                echo "✅ Code checked out from branch: ${env.BRANCH_NAME}"
+            }
+        }
+
+        // ─────────────────────────────────────
+        stage('🔨 Build') {
+            steps {
+                sh 'mvn clean package -DskipTests'
+                echo "✅ Build successful — artifact: target/${APP_NAME}.jar"
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+                }
+            }
+        }
+
+        // ─────────────────────────────────────
+        stage('🧪 Unit Tests') {
+            steps {
+                sh 'mvn test'
+            }
+            post {
+                always {
+                    junit 'target/surefire-reports/*.xml'
+                    publishHTML(target: [
+                        reportDir: 'target/site/jacoco',
+                        reportFiles: 'index.html',
+                        reportName: 'Code Coverage'
+                    ])
+                }
+            }
+        }
+
+        // ─────────────────────────────────────
+        stage('🔍 SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube-Server') {
+                    sh """
+                        mvn sonar:sonar \
+                          -Dsonar.projectKey=${SONAR_PROJECT} \
+                          -Dsonar.projectName="${APP_NAME}" \
+                          -Dsonar.java.coveragePlugin=jacoco \
+                          -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────
+        stage('🚦 Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+                echo "✅ SonarQube Quality Gate passed!"
+            }
+        }
+
+        // ─────────────────────────────────────
+        stage('🛡️ Trivy — Filesystem Scan') {
+            steps {
+                sh """
+                    # Install Trivy if not present
+                    if ! command -v trivy &> /dev/null; then
+                        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+                    fi
+
+                    # Scan filesystem for vulnerabilities
+                    trivy fs . \
+                        --exit-code 1 \
+                        --severity CRITICAL \
+                        --format table \
+                        --output trivy-fs-report.txt
+
+                    echo "✅ Filesystem scan passed — no CRITICAL vulnerabilities"
+                """
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-fs-report.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ─────────────────────────────────────
+        stage('🐳 Docker Build') {
+            steps {
+                script {
+                    docker.build("${ECR_REPO}:${IMAGE_TAG}", "-f docker/app/Dockerfile .")
+                    docker.build("${ECR_REPO}:latest",       "-f docker/app/Dockerfile .")
+                }
+                echo "✅ Docker image built: ${ECR_REPO}:${IMAGE_TAG}"
+            }
+        }
+
+        // ─────────────────────────────────────
+        stage('🛡️ Trivy — Image Scan') {
+            steps {
+                sh """
+                    trivy image \
+                        --exit-code 1 \
+                        --severity HIGH,CRITICAL \
+                        --format table \
+                        --output trivy-image-report.txt \
+                        ${ECR_REPO}:${IMAGE_TAG}
+
+                    echo "✅ Image scan passed — no HIGH/CRITICAL CVEs"
+                """
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-image-report.txt', allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ─────────────────────────────────────
+        stage('📤 Push to AWS ECR') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    sh """
+                        aws ecr get-login-password --region ${AWS_REGION} | \
+                            docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                        docker push ${ECR_REPO}:${IMAGE_TAG}
+                        docker push ${ECR_REPO}:latest
+
+                        echo "✅ Image pushed to ECR: ${ECR_REPO}:${IMAGE_TAG}"
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────
+        stage('🏗️ Terraform — Provision Infrastructure') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    sh """
+                        cd terraform/environments/${TF_ENV}
+
+                        terraform init \
+                            -backend-config="bucket=terraform-state-${APP_NAME}" \
+                            -backend-config="key=${TF_ENV}/terraform.tfstate" \
+                            -backend-config="region=${AWS_REGION}" \
+                            -input=false
+
+                        terraform plan \
+                            -var="image_tag=${IMAGE_TAG}" \
+                            -var="environment=${TF_ENV}" \
+                            -out=tfplan \
+                            -input=false
+
+                        terraform apply tfplan
+
+                        echo "✅ Infrastructure provisioned successfully (20+ AWS resources)"
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────
+        stage('🚀 Deploy to Kubernetes') {
+            steps {
+                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                  credentialsId: 'aws-credentials']]) {
+                    sh """
+                        # Update kubeconfig
+                        aws eks update-kubeconfig \
+                            --region ${AWS_REGION} \
+                            --name ${APP_NAME}-eks-${TF_ENV}
+
+                        # Update image tag in deployment
+                        sed -i "s|IMAGE_TAG|${IMAGE_TAG}|g" kubernetes/deployment.yaml
+
+                        # Apply manifests
+                        kubectl apply -f kubernetes/deployment.yaml
+                        kubectl apply -f kubernetes/service.yaml
+
+                        # Wait for rollout
+                        kubectl rollout status deployment/${APP_NAME} \
+                            --namespace ${TF_ENV} \
+                            --timeout=300s
+
+                        echo "✅ Deployment successful!"
+                        kubectl get pods -n ${TF_ENV}
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────
+        stage('🔍 Smoke Test') {
+            steps {
+                sh """
+                    APP_URL=\$(kubectl get svc ${APP_NAME} \
+                        -n ${TF_ENV} \
+                        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+                    echo "Testing app at: http://\$APP_URL/health"
+
+                    # Retry up to 10 times
+                    for i in \$(seq 1 10); do
+                        STATUS=\$(curl -s -o /dev/null -w "%{http_code}" http://\$APP_URL/health)
+                        if [ "\$STATUS" = "200" ]; then
+                            echo "✅ Smoke test passed! App is healthy."
+                            exit 0
+                        fi
+                        echo "Attempt \$i: Status \$STATUS — retrying in 10s..."
+                        sleep 10
+                    done
+
+                    echo "❌ Smoke test failed!"
+                    exit 1
+                """
+            }
+        }
+    }
+
+    // ─────────────────────────────────────
+    post {
+        success {
+            slackSend(
+                channel: '#deployments',
+                color: 'good',
+                message: "✅ *${APP_NAME}* deployed successfully!\n" +
+                         "Branch: `${BRANCH_NAME}` | Build: `#${BUILD_NUMBER}` | " +
+                         "Environment: `${TF_ENV}`"
+            )
+        }
+        failure {
+            slackSend(
+                channel: '#deployments',
+                color: 'danger',
+                message: "❌ *${APP_NAME}* pipeline FAILED!\n" +
+                         "Branch: `${BRANCH_NAME}` | Build: `#${BUILD_NUMBER}` | " +
+                         "Stage: `${currentBuild.displayName}`\n" +
+                         "Check logs: ${BUILD_URL}"
+            )
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
